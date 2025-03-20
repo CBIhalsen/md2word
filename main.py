@@ -1,5 +1,4 @@
 
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -10,27 +9,33 @@
 - Markdown 星号: *斜体*，**加粗**，***粗斜体***
 - 表格单元格中的行内公式与星号
 - 代码块(```...```)原样写入
+- 图片引用: ![alt文本](image.png 或 http://xxx)，插入到 Word 并居中显示
+  并且限制图片最大宽度为可用正文宽度的 80%。
 
 在处理行内文本时，我们会统一拆分:
 (\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|\${2}.*?\${2}|\\\[.*?\\\]|\\\(.*?\)|\$.*?\$)
 
 需要:
-1) pip install latex2mathml python-docx lxml markdown
+1) pip install latex2mathml python-docx lxml markdown requests
 2) 在脚本同目录下放 MML2OMML.XSL (或自行修改 xsl_path).
 """
 
 import os
 import re
+import requests
 import markdown
 import latex2mathml.converter
 from latex2mathml.exceptions import NoAvailableTokensError
 from lxml import etree
+from io import BytesIO
 from docx import Document
 from docx import shared
+from docx.shared import Emu
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from docx.enum.text import WD_ALIGN_PARAGRAPH  # 新增
-# --------------------- 新增部分：用于插入水平线 -----------------------------
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# --------------------- 用于插入水平线 -----------------------------
 def insert_horizontal_rule(doc):
     """
     在 doc 中插入一个“水平分割线”段落 (通过底部边框模拟)。
@@ -60,8 +65,6 @@ def latex_to_omml(latex_input, xsl_path):
         print("[DEBUG] -> 公式内容为空，返回 None")
         return None
     try:
-        # 若 latex2mathml 对某些符号(例\nabla)不支持，可在此做替换
-        # latex_input_stripped = latex_input_stripped.replace(r'\nabla', '∇')
         mathml_output = latex2mathml.converter.convert(latex_input_stripped)
         print(f"[DEBUG] -> latex2mathml转换成功, MathML片段(截断): {mathml_output[:80]}...")
         xsl_tree = etree.parse(xsl_path)
@@ -96,7 +99,6 @@ def add_runs_with_inline_markdown(text, paragraph, xsl_path):
     并在python-docx的paragraph中插入对应的Run或OMML节点。
     """
     print(f"[DEBUG] -> 解析行内标记: {repr(text)}")
-    # 修正后的正则表达式:
     inline_pattern = (
         r'(\*\*\*[^*]+\*\*\*|'    # ***粗斜体***
         r'\*\*[^*]+\*\*|'         # **加粗**
@@ -112,7 +114,7 @@ def add_runs_with_inline_markdown(text, paragraph, xsl_path):
     for seg in segments:
         # 如果 seg 能二次匹配说明它是一个公式或星号标记
         if re.match(inline_pattern, seg, flags=re.DOTALL):
-            # (A) 先判断是否是公式
+            # (A) 判断是否是公式
             formula_pattern = r'(\${1,2}[\s\S]*?\${1,2}|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\))'
             if re.match(formula_pattern, seg, flags=re.DOTALL):
                 print(f"[DEBUG] -> 检测到公式段: {repr(seg)}")
@@ -121,9 +123,9 @@ def add_runs_with_inline_markdown(text, paragraph, xsl_path):
                 if omml_elem is not None:
                     paragraph._element.append(omml_elem)
                 else:
-                    paragraph.add_run(seg)  # 转换失败则原样
+                    paragraph.add_run(seg)  # 转换失败则原样保留
             else:
-                # (B) 否则就是星号标记
+                # (B) 星号标记
                 print(f"[DEBUG] -> 检测到星号标记: {repr(seg)}")
                 triple_star_pattern = r'^\*\*\*([^*]+)\*\*\*$'
                 double_star_pattern = r'^\*\*([^*]+)\*\*$'
@@ -150,21 +152,111 @@ def add_runs_with_inline_markdown(text, paragraph, xsl_path):
             # 普通文本
             paragraph.add_run(seg)
 
+def get_usable_width(doc):
+    """
+    计算Word文档的内容区宽度(单位: EMU) = 页面宽度 - 左右边距。
+    """
+    section = doc.sections[0]
+    page_width = section.page_width
+    left_margin = section.left_margin
+    right_margin = section.right_margin
+    return page_width - left_margin - right_margin
+
+def handle_image(doc, alt_text, image_url, md_file_path):
+    """
+    将图片插入 Word：
+    - 若 image_url 是网络地址，则下载后插入；
+    - 若是本地(相对/绝对)路径，则直接插入；
+    - 将所在段落居中对齐，并限制图片不超过内容区宽度的80%(高度自适应)。
+    """
+    print(f"[DEBUG] -> 插入图片, alt_text={alt_text}, url={image_url}")
+    paragraph = doc.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run()
+
+    # 可用宽度(EMU)
+    max_width_emu = int(get_usable_width(doc) * 0.8)
+
+    if image_url.lower().startswith('http://') or image_url.lower().startswith('https://'):
+        # 网络图片
+        try:
+            resp = requests.get(image_url, timeout=10)
+            if resp.status_code == 200:
+                image_data = BytesIO(resp.content)
+                run.add_picture(image_data, width=Emu(max_width_emu))
+            else:
+                doc.add_paragraph(f"(图片加载失败: {image_url}, status={resp.status_code})")
+        except Exception as e:
+            doc.add_paragraph(f"(下载图片时出错: {image_url}, err={e})")
+    else:
+        # 本地图片
+        if not os.path.isabs(image_url):
+            md_dir = os.path.dirname(os.path.abspath(md_file_path))
+            image_url = os.path.join(md_dir, image_url)
+        if os.path.exists(image_url):
+            try:
+                run.add_picture(image_url, width=Emu(max_width_emu))
+            except Exception as e:
+                doc.add_paragraph(f"(插入图片时出错: {image_url}, err={e})")
+        else:
+            doc.add_paragraph(f"(图片未找到: {image_url})")
+
+def parse_line_for_images_and_text(line, doc, xsl_path, md_file_path):
+    """
+    识别行内的 Markdown 图片引用(![alt](url)) 并插入 Word(含居中、宽度限制)，
+    剩余文本则交给 add_runs_with_inline_markdown() 处理斜体/加粗/公式等。
+    """
+    img_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+
+    segments = []
+    last_idx = 0
+
+    for match in re.finditer(img_pattern, line):
+        start, end = match.span()
+        # 图片前的普通文本
+        if start > last_idx:
+            segments.append(("text", line[last_idx:start]))
+        alt_text = match.group(1)
+        img_url = match.group(2)
+        segments.append(("image", alt_text, img_url))
+        last_idx = end
+
+    # 结尾剩余文本
+    if last_idx < len(line):
+        segments.append(("text", line[last_idx:]))
+
+    # 依次写入
+    for seg in segments:
+        if seg[0] == "text":
+            text_content = seg[1]
+            # 如果只有空白，留一个空段落
+            if text_content.strip():
+                paragraph = doc.add_paragraph(style=None)
+                add_runs_with_inline_markdown(text_content, paragraph, xsl_path)
+            else:
+                doc.add_paragraph("")
+        else:
+            # seg[0] == "image"
+            alt_text, img_url = seg[1], seg[2]
+            handle_image(doc, alt_text, img_url, md_file_path)
+
 def convert_markdown_to_docx(md_file, xsl_path, output_docx):
     """
-    将 Markdown 文件转换为 Word (docx).
-    - 行内星号(斜体/加粗/粗斜体) 和 行内公式(LaTeX) 都能被识别
-    - 多行块公式、表格、代码块等也保留
+    主函数：将 Markdown 文件转换为 Word (docx).
+    - 解析标题、表格、公式、代码块、图片、列表等
+    - 自动将图片限制为内容区宽度的80%，并居中
+    - 最终保存为 output_docx
     """
     print(f"[DEBUG] -> 开始读取Markdown文件: {md_file}")
     with open(md_file, 'r', encoding='utf-8') as f:
         md_text = f.read()
     print("[DEBUG] -> 读取完成, 字符数: ", len(md_text))
 
-    # 测试下 markdown -> html, 不做实际处理
+    # 测试 markdown -> html (不做实际使用)，仅验证 markdown 包
     _ = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
 
     doc = Document()
+    # 设置全局的字体/字号
     doc.styles['Normal'].font.name = 'Times New Roman'
     doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), u'宋体')
     doc.styles['Normal'].font.size = shared.Pt(10)
@@ -182,7 +274,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
     def flush_table(doc_obj):
         """
         将 table_buffer 中的行转换成表格插入 docObj，并清空。
-        在插入过程中解析单元格中的行内星号和公式。
+        表格单元格中也支持行内公式、星号标记，但暂不处理图片。
         """
         nonlocal table_buffer
         if not table_buffer:
@@ -217,7 +309,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
         line_stripped = line.strip()
         print(f"\n[DEBUG] -> 处理行: {repr(line_stripped)}")
 
-        # 代码块检测
+        # 1. 代码块检测
         if line_stripped.startswith('```'):
             in_code_block = not in_code_block
             print(f"[DEBUG] -> {'进入' if in_code_block else '退出'}代码块")
@@ -232,11 +324,11 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
             doc.add_paragraph(line)
             continue
 
-        # 若在多行块公式中
+        # 2. 块公式是否在进行中
         if in_math_block:
             if line_stripped.endswith('$$') or line_stripped.endswith('\\]'):
                 math_block_buffer.append(line)
-                print("[DEBUG] -> 块公式结束, 开始转换")
+                print("[DEBUG] -> 块公式结束, 开始转换...")
                 in_math_block = False
                 block_content = "\n".join(math_block_buffer)
                 block_content_stripped = strip_delimiters(block_content)
@@ -252,7 +344,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
                 math_block_buffer.append(line)
                 continue
 
-        # 检查多行块公式的开始
+        # 3. 检查多行块公式的开始
         if (
             (line_stripped.startswith('$$') or line_stripped.startswith('\\[')) and
             not (line_stripped.endswith('$$') or line_stripped.endswith('\\]'))
@@ -262,7 +354,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
             math_block_buffer = [line]
             continue
 
-        # 单行块公式
+        # 4. 单行块公式
         block_patt = r'^(?:\${2}.*?\${2}|\\\[.*?\\\])$'
         if re.match(block_patt, line_stripped):
             print("[DEBUG] -> 单行块公式")
@@ -275,7 +367,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
                 paragraph.add_run(line_stripped)
             continue
 
-        # 空行
+        # 5. 空行
         if not line_stripped:
             print("[DEBUG] -> 空行")
             if table_mode:
@@ -284,9 +376,9 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
             doc.add_paragraph("")
             continue
 
-        # 表格行
+        # 6. 表格行
         if line_stripped.startswith('|') and line_stripped.endswith('|'):
-            # 如果整行只含 '-', '|', ':' 等字符(典型 markdown 表头分隔)，跳过
+            # 如果整行只含 '-', '|', ':' 等字符(典型markdown表头分隔)，跳过
             if all(ch in '-|: ' for ch in line_stripped):
                 print("[DEBUG] -> 检测到 Markdown 表格分隔行，跳过")
                 continue
@@ -299,14 +391,13 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
                 flush_table(doc)
                 table_mode = False
 
-        # --------------------- 新增逻辑：检测 '---' 就插入水平线 ---------------------
+        # 7. 水平线 "---"
         if line_stripped == '---':
             print("[DEBUG] -> 检测到水平线标记 '---'")
-            insert_horizontal_rule(doc)   # 调用我们上面新增的函数
+            insert_horizontal_rule(doc)
             continue
-        # --------------------- 新增逻辑结束 -----------------------------------------
 
-        # 标题(# 开头)
+        # 8. 标题(# 开头)
         if line_stripped.startswith('#'):
             match_hashes = re.match(r'^(#+)', line_stripped)
             level = len(match_hashes.group(1)) if match_hashes else 1
@@ -315,7 +406,7 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
             doc.add_heading(heading_text, min(level, 6))
             continue
 
-        # 无序列表
+        # 9. 无序列表
         if line_stripped.startswith('* ') or line_stripped.startswith('- '):
             item_text = line_stripped[1:].strip()
             print(f"[DEBUG] -> 无序列表项: {item_text}")
@@ -323,12 +414,11 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
             paragraph.add_run("• " + item_text)
             continue
 
-        # 剩下的普通行(含可能的行内公式/星号)
-        print("[DEBUG] -> 普通文本行(可能含行内公式或星号)")
-        paragraph = doc.add_paragraph(style=None)
-        add_runs_with_inline_markdown(line_stripped, paragraph, xsl_path)
+        # 10. 普通文本行(可能含行内公式、星号或图片)
+        print("[DEBUG] -> 普通文本行(可能含图片/公式/星号)")
+        parse_line_for_images_and_text(line, doc, xsl_path, md_file)
 
-    # 结尾可能还有表格未flush
+    # 文档末尾，可能还有表格缓存
     if table_mode:
         flush_table(doc)
 
@@ -336,8 +426,8 @@ def convert_markdown_to_docx(md_file, xsl_path, output_docx):
     print(f"[DEBUG] -> 已生成 Word 文档: {output_docx}")
 
 if __name__ == "__main__":
-    # 设置 XSLT路径
+    # 设置 XSLT 路径
     xsl_path = os.path.join('.', 'MML2OMML.XSL')
-    md_file = "example.md"  # 你的Markdown文件
-    output_docx = "output_from_markdown_stars_and_formula.docx"
+    md_file = "example.md"  # 你的Markdown文件路径
+    output_docx = "79utput_with_scaled_images.docx"
     convert_markdown_to_docx(md_file, xsl_path, output_docx)
